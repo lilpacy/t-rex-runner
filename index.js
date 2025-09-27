@@ -2746,7 +2746,205 @@
 
 
 function onDocumentLoad() {
-    new Runner('.interstitial-wrapper');
+    window.__runner = new Runner('.interstitial-wrapper');
+    setupCameraJumpController();
 }
 
 document.addEventListener('DOMContentLoaded', onDocumentLoad);
+
+// Camera-based jump controller (MediaPipe Pose)
+function setupCameraJumpController() {
+    var toggle = document.getElementById('cameraToggle');
+    var videoEl = document.getElementById('poseVideo');
+    var statusEl = document.getElementById('cameraStatus');
+    if (!toggle || !videoEl) return;
+
+    var controller = (function () {
+        var scriptsLoaded = false;
+        var pose = null;
+        var stream = null;
+        var rafId = 0;
+        var running = false;
+        var state = {
+            baselineY: null,
+            jumping: false,
+            lastDownTs: 0
+        };
+
+        function loadScript(src) {
+            return new Promise(function (resolve, reject) {
+                var s = document.createElement('script');
+                s.src = src;
+                s.async = true;
+                s.onload = resolve;
+                s.onerror = reject;
+                document.head.appendChild(s);
+            });
+        }
+
+        function ensureLibs() {
+            if (scriptsLoaded) return Promise.resolve();
+            // MediaPipe Pose only (we'll use getUserMedia + RAF)
+            var basePose = 'https://cdn.jsdelivr.net/npm/@mediapipe/pose@0.5';
+            return loadScript(basePose + '/pose.js')
+                .then(function () { scriptsLoaded = true; });
+        }
+
+        function dispatchSpace(type) {
+            var evt = new KeyboardEvent(type, {
+                key: ' ',
+                code: 'Space',
+                keyCode: 32,
+                which: 32,
+                bubbles: true,
+                cancelable: true
+            });
+            // Some browsers ignore keyCode in ctor; define getters.
+            try { Object.defineProperty(evt, 'keyCode', { get: function () { return 32; } }); } catch (e) {}
+            try { Object.defineProperty(evt, 'which', { get: function () { return 32; } }); } catch (e) {}
+            document.dispatchEvent(evt);
+        }
+
+        function onResults(results) {
+            if (!results || !results.poseLandmarks || !running) return;
+            var lm = results.poseLandmarks;
+            // HIP landmarks: 23 (left), 24 (right)
+            var lh = lm[23], rh = lm[24];
+            if (!lh || !rh) return;
+            var y = (lh.y + rh.y) / 2; // normalized 0..1 (top=0)
+
+            if (state.baselineY == null) {
+                state.baselineY = y;
+                return;
+            }
+
+            // Update baseline slowly when not jumping
+            if (!state.jumping) {
+                state.baselineY = state.baselineY * 0.95 + y * 0.05;
+            }
+
+            var delta = state.baselineY - y; // positive when body moves up
+
+            var now = performance.now ? performance.now() : Date.now();
+            var jumpRiseThreshold = 0.08; // tune if needed
+            var releaseThreshold = 0.02;
+            var maxHoldMs = 450;
+
+            if (!state.jumping && delta > jumpRiseThreshold) {
+                // Start jump
+                dispatchSpace('keydown');
+                state.jumping = true;
+                state.lastDownTs = now;
+            }
+
+            if (state.jumping) {
+                var shouldRelease = (y > state.baselineY - releaseThreshold) ||
+                    (now - state.lastDownTs > maxHoldMs);
+                if (shouldRelease) {
+                    dispatchSpace('keyup');
+                    state.jumping = false;
+                }
+            }
+        }
+
+        function start() {
+            if (running) return Promise.resolve();
+            return ensureLibs().then(function () {
+                // global Pose and Camera provided by loaded scripts
+                pose = new window.Pose({
+                    locateFile: function (file) {
+                        return 'https://cdn.jsdelivr.net/npm/@mediapipe/pose@0.5/' + file;
+                    }
+                });
+                pose.setOptions({
+                    modelComplexity: 0,
+                    smoothLandmarks: true,
+                    enableSegmentation: false,
+                    minDetectionConfidence: 0.5,
+                    minTrackingConfidence: 0.5
+                });
+                pose.onResults(onResults);
+
+                state.baselineY = null;
+                state.jumping = false;
+                state.lastDownTs = 0;
+
+                // getUserMedia
+                return navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } }, audio: false })
+                    .then(function (s) {
+                        stream = s;
+                        videoEl.srcObject = s;
+                        // Force autoplay-friendly settings
+                        try { videoEl.muted = true; } catch (e) {}
+                        try { videoEl.autoplay = true; } catch (e) {}
+                        try { videoEl.playsInline = true; } catch (e) {}
+                        videoEl.setAttribute('muted', '');
+                        videoEl.setAttribute('autoplay', '');
+                        videoEl.setAttribute('playsinline', '');
+
+                        // Show preview (mirrored)
+                        videoEl.style.display = 'block';
+                        videoEl.style.position = 'fixed';
+                        videoEl.style.right = '8px';
+                        videoEl.style.bottom = '8px';
+                        videoEl.style.width = '200px';
+                        videoEl.style.height = 'auto';
+                        videoEl.style.transform = 'scaleX(-1)';
+                        videoEl.style.borderRadius = '8px';
+                        videoEl.style.boxShadow = '0 1px 6px rgba(0,0,0,0.3)';
+                        videoEl.style.zIndex = '9998';
+
+                        var playPromise = videoEl.play();
+                        if (playPromise && typeof playPromise.then === 'function') {
+                            playPromise.catch(function (e) { console.warn('video.play blocked', e); });
+                        }
+                        videoEl.onloadedmetadata = function () { try { videoEl.play(); } catch (e) {} };
+
+                        running = true;
+                        if (statusEl) statusEl.textContent = 'ON';
+
+                        // RAF loop
+                        (function loop() {
+                            if (!running) return;
+                            rafId = requestAnimationFrame(loop);
+                            if (videoEl.readyState >= 2) {
+                                pose.send({ image: videoEl });
+                            }
+                        })();
+                    });
+            }).catch(function (err) {
+                running = false;
+                console.error('Camera start failed', err);
+                alert('Camera start failed. Please use HTTPS and allow webcam.');
+                if (statusEl) statusEl.textContent = 'OFF';
+            });
+        }
+
+        function stop() {
+            running = false;
+            if (rafId) { try { cancelAnimationFrame(rafId); } catch (e) {} rafId = 0; }
+            try {
+                if (stream) {
+                    stream.getTracks().forEach(function (t) { try { t.stop(); } catch (e) {} });
+                }
+            } catch (e) {}
+            try { if (pose && pose.close) pose.close(); } catch (e) {}
+            stream = null;
+            pose = null;
+            if (statusEl) statusEl.textContent = 'OFF';
+            try { videoEl.pause(); } catch (e) {}
+            try { videoEl.srcObject = null; } catch (e) {}
+            videoEl.style.display = 'none';
+        }
+
+        return { start: start, stop: stop };
+    })();
+
+    toggle.addEventListener('change', function () {
+        if (toggle.checked) {
+            controller.start();
+        } else {
+            controller.stop();
+        }
+    });
+}

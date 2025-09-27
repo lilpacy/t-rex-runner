@@ -29,6 +29,14 @@
             </template>
         </div>
     </div>
+    <div id="camera-controls"
+        style="position:fixed;top:8px;right:8px;z-index:9999;background:rgba(255,255,255,0.8);padding:6px 10px;border-radius:6px;box-shadow:0 1px 4px rgba(0,0,0,0.15);font-family:'Open Sans', sans-serif;">
+        <label style="cursor:pointer;white-space:nowrap;">
+            <input id="cameraToggle" type="checkbox" style="vertical-align:middle;margin-right:6px;">Use Camera Jump
+        </label>
+        <span id="cameraStatus" style="margin-left:8px;color:#555;">OFF</span>
+    </div>
+    <video id="poseVideo" playsinline muted style="display:none;"></video>
 </body>
 
 <script>
