@@ -2765,10 +2765,19 @@ function setupCameraJumpController() {
         var stream = null;
         var rafId = 0;
         var running = false;
+        // Simple motion detection buffers (downscaled for speed)
+        var motionCanvas = null;
+        var motionCtx = null;
+        var motionW = 64, motionH = 48;
+        var prevGray = null;
+        var motionThreshold = 0.035; // lower = more sensitive
+        var maxHoldMs = 450;
         var state = {
             baselineY: null,
             jumping: false,
-            lastDownTs: 0
+            lastDownTs: 0,
+            lastY: null,
+            cooldownUntil: 0
         };
 
         function loadScript(src) {
@@ -2808,10 +2817,15 @@ function setupCameraJumpController() {
         function onResults(results) {
             if (!results || !results.poseLandmarks || !running) return;
             var lm = results.poseLandmarks;
-            // HIP landmarks: 23 (left), 24 (right)
-            var lh = lm[23], rh = lm[24];
-            if (!lh || !rh) return;
-            var y = (lh.y + rh.y) / 2; // normalized 0..1 (top=0)
+            // Head landmarks: nose(0), leftEye(2), rightEye(5)
+            var ids = [0, 2, 5];
+            var sum = 0, cnt = 0;
+            for (var i = 0; i < ids.length; i++) {
+                var p = lm[ids[i]];
+                if (p && typeof p.y === 'number') { sum += p.y; cnt++; }
+            }
+            if (!cnt) return;
+            var y = sum / cnt; // normalized 0..1 (top=0)
 
             if (state.baselineY == null) {
                 state.baselineY = y;
@@ -2820,17 +2834,24 @@ function setupCameraJumpController() {
 
             // Update baseline slowly when not jumping
             if (!state.jumping) {
-                state.baselineY = state.baselineY * 0.95 + y * 0.05;
+                state.baselineY = state.baselineY * 0.92 + y * 0.08;
             }
 
             var delta = state.baselineY - y; // positive when body moves up
+            var prevY = state.lastY;
+            state.lastY = y;
+
+            var dy = (prevY == null) ? 0 : (prevY - y); // positive when moving up
 
             var now = performance.now ? performance.now() : Date.now();
-            var jumpRiseThreshold = 0.08; // tune if needed
-            var releaseThreshold = 0.02;
+            if (now < state.cooldownUntil) return;
+
+            var jumpRiseThreshold = 0.06; // head-based rise
+            var minRiseStep = 0.01; // instantaneous upward step
+            var releaseThreshold = 0.015;
             var maxHoldMs = 450;
 
-            if (!state.jumping && delta > jumpRiseThreshold) {
+            if (!state.jumping && delta > jumpRiseThreshold && dy > minRiseStep) {
                 // Start jump
                 dispatchSpace('keydown');
                 state.jumping = true;
@@ -2843,6 +2864,7 @@ function setupCameraJumpController() {
                 if (shouldRelease) {
                     dispatchSpace('keyup');
                     state.jumping = false;
+                    state.cooldownUntil = now + 200; // short cooldown to avoid retrigger
                 }
             }
         }
@@ -2909,6 +2931,14 @@ function setupCameraJumpController() {
                             rafId = requestAnimationFrame(loop);
                             if (videoEl.readyState >= 2) {
                                 pose.send({ image: videoEl });
+                        detectMotionAndMaybeJump();
+                        // Fallback release if pose results lag
+                        var nowTs = performance.now ? performance.now() : Date.now();
+                        if (state.jumping && (nowTs - state.lastDownTs > maxHoldMs)) {
+                            dispatchSpace('keyup');
+                            state.jumping = false;
+                            state.cooldownUntil = nowTs + 200;
+                        }
                             }
                         })();
                     });
@@ -2935,6 +2965,38 @@ function setupCameraJumpController() {
             try { videoEl.pause(); } catch (e) {}
             try { videoEl.srcObject = null; } catch (e) {}
             videoEl.style.display = 'none';
+        }
+
+        function detectMotionAndMaybeJump() {
+            if (!motionCanvas) {
+                motionCanvas = document.createElement('canvas');
+                motionCanvas.width = motionW;
+                motionCanvas.height = motionH;
+                motionCtx = motionCanvas.getContext('2d', { willReadFrequently: true });
+            }
+            motionCtx.drawImage(videoEl, 0, 0, motionW, motionH);
+            var img = motionCtx.getImageData(0, 0, motionW, motionH);
+            var data = img.data;
+            var num = motionW * motionH;
+            var curGray = prevGray && prevGray.length === num ? prevGray : new Uint8Array(num);
+            var diffSum = 0;
+            for (var i = 0, p = 0; i < data.length; i += 4, p++) {
+                var r = data[i], g = data[i + 1], b = data[i + 2];
+                var y = ((r * 299) + (g * 587) + (b * 114)) / 1000; // 0..255
+                var prev = curGray[p];
+                var d = prev ? Math.abs(y - prev) : 0;
+                diffSum += d;
+                curGray[p] = y;
+            }
+            var diffNorm = diffSum / (num * 255);
+            prevGray = curGray;
+
+            var nowTs = performance.now ? performance.now() : Date.now();
+            if (!state.jumping && nowTs >= state.cooldownUntil && diffNorm > motionThreshold) {
+                dispatchSpace('keydown');
+                state.jumping = true;
+                state.lastDownTs = nowTs;
+            }
         }
 
         return { start: start, stop: stop };
